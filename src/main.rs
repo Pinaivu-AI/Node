@@ -54,6 +54,12 @@ struct Args {
     #[arg(long, default_value_t = 50)]
     price_per_1k_nanox: u64,
 
+    /// Sui address advertised in every InferenceBid as the payout
+    /// destination. The coordinator names this address in the on-chain
+    /// vault::settle call when the job completes. Optional in dev.
+    #[arg(long, default_value = "")]
+    payout_address: String,
+
     /// Persisted Ed25519 identity file. Created on first run; reused
     /// thereafter so this node has a stable PeerId.
     #[arg(long)]
@@ -106,6 +112,7 @@ async fn main() -> Result<()> {
         model: args.model.clone(),
         price_per_1k_nanox: args.price_per_1k_nanox,
         advertise_url: advertise_url.clone(),
+        payout_address: args.payout_address.clone(),
         inflight: inflight.clone(),
     })
     .await?;

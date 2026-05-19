@@ -12,6 +12,10 @@ pub struct BidConfig {
     pub node_peer_id: String,
     pub price_per_1k_nanox: u64,
     pub http_endpoint: String,
+    /// Sui address the coordinator will name in the routing receipt's
+    /// `payouts` list so the vault contract pays this node when the
+    /// job settles. Empty in dev means "no on-chain payout expected".
+    pub payout_address: String,
 }
 
 pub fn build_bid(req: &InferenceRequest, cfg: &BidConfig) -> Option<InferenceBid> {
@@ -25,5 +29,6 @@ pub fn build_bid(req: &InferenceRequest, cfg: &BidConfig) -> Option<InferenceBid
         latency_ms: 300,
         reputation: 0.9,
         http_endpoint: cfg.http_endpoint.clone(),
+        payout_address: cfg.payout_address.clone(),
     })
 }

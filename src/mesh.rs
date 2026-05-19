@@ -36,6 +36,9 @@ pub struct Config {
     pub price_per_1k_nanox: u64,
     pub advertise_url: String,
     pub inflight: Arc<Inflight>,
+    /// Sui address advertised in every InferenceBid as the destination
+    /// for on-chain settlement payouts. Plumbed from CLI.
+    pub payout_address: String,
 }
 
 pub struct Handle {
@@ -105,6 +108,7 @@ pub async fn spawn(cfg: Config) -> Result<Handle> {
         node_peer_id: local_peer_id.to_string(),
         price_per_1k_nanox: cfg.price_per_1k_nanox,
         http_endpoint: cfg.advertise_url.clone(),
+        payout_address: cfg.payout_address.clone(),
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
