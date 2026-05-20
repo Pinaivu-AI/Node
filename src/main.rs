@@ -50,8 +50,8 @@ struct Args {
     #[arg(long, default_value = "llama3")]
     model: String,
 
-    /// Asking price in NanoX per 1k tokens. Used in every bid we publish.
-    #[arg(long, default_value_t = 50)]
+    /// Asking price in MIST per 1k tokens (1 MIST = 1 Sui base unit).
+    #[arg(long, default_value_t = 1_000_000)]
     price_per_1k_nanox: u64,
 
     /// Sui address advertised in every InferenceBid as the payout
@@ -59,6 +59,7 @@ struct Args {
     /// vault::settle call when the job completes. Optional in dev.
     #[arg(long, default_value = "")]
     payout_address: String,
+
 
     /// Persisted Ed25519 identity file. Created on first run; reused
     /// thereafter so this node has a stable PeerId.
