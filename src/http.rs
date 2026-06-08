@@ -39,8 +39,40 @@ pub struct State {
 
 #[derive(Deserialize)]
 struct InferenceReq {
-    prompt: String,
+    /// The user's new message for this turn. Older client builds may
+    /// still send this under the legacy `prompt` key.
+    #[serde(alias = "prompt")]
+    new_user_message: String,
     dispatch_token: DispatchToken,
+    /// Session this turn belongs to. Must match `dispatch_token.session_id`.
+    session_id: Uuid,
+    /// AES-256 key used to encrypt/decrypt the session blob on Walrus
+    /// and KV-cache blocks. Transmitted in the HTTPS body so the node
+    /// can fetch and decrypt history; wiped from memory after the turn.
+    /// Base64-encoded for JSON transport. Consumed in Phase 16 Step 3.
+    #[serde(default, with = "session_key_b64")]
+    #[allow(dead_code)]
+    session_key: Option<[u8; 32]>,
+}
+
+mod session_key_b64 {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 32]>, D::Error> {
+        let opt: Option<String> = Option::deserialize(d)?;
+        match opt {
+            None => Ok(None),
+            Some(s) => {
+                let raw = STANDARD.decode(s.as_bytes()).map_err(serde::de::Error::custom)?;
+                let arr: [u8; 32] = raw
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| serde::de::Error::custom("session_key must be 32 bytes"))?;
+                Ok(Some(arr))
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -77,8 +109,16 @@ async fn handle_inference(
         .map_err(|e| ErrorResponse::unauthorized(format!("dispatch token verify failed: {e}")))?;
 
     let request_id = req.dispatch_token.request_id;
+    let session_id = req.dispatch_token.session_id;
 
-    // 2. Defensive: confirm we bid on this. The signed token is the
+    // 2a. Body session_id must agree with the signed dispatch token.
+    if req.session_id != session_id {
+        return Err(ErrorResponse::bad_request(
+            "session_id does not match dispatch_token.session_id",
+        ));
+    }
+
+    // 2b. Defensive: confirm we bid on this. The signed token is the
     // real authority, but if we don't have a matching bid record then
     // something is off — refuse.
     if !state.inflight.contains(&request_id) {
@@ -88,7 +128,11 @@ async fn handle_inference(
     }
 
     // 3. Run inference.
-    let reply = ollama::chat(&state.ollama_url, &state.model, &req.prompt)
+    //    Phase 16 Step 3 will fetch history from Postgres + Walrus
+    //    (decrypted with `req.session_key`) and assemble the full
+    //    sliding window before this call. For now we send the single
+    //    new user message and the node sees just this turn.
+    let reply = ollama::chat(&state.ollama_url, &state.model, &req.new_user_message)
         .await
         .map_err(|e| ErrorResponse::internal(format!("ollama: {e}")))?;
 
@@ -105,10 +149,10 @@ async fn handle_inference(
     // the coordinator's libp2p round-trip.
     let inputs = ProofInputs {
         request_id,
-        session_id: Uuid::new_v4(),
+        session_id,
         client_address: hex::encode(req.dispatch_token.client_pubkey),
         model_id: state.model.clone(),
-        prompt: req.prompt,
+        prompt: req.new_user_message,
         output: reply.content,
         input_tokens: reply.prompt_tokens,
         output_tokens: reply.completion_tokens,
