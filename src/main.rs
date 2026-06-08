@@ -5,17 +5,14 @@
 //! coordinator after each completed job.
 
 mod bidder;
+mod cipher;
 mod completion;
+mod context;
 mod http;
 mod identity;
 mod inflight;
 mod mesh;
 mod ollama;
-
-// Phase 16 context layer — fully wired in Step 3.
-#[allow(dead_code)]
-mod cipher;
-#[allow(dead_code)]
 mod walrus;
 
 use std::sync::Arc;
@@ -71,6 +68,12 @@ struct Args {
     /// thereafter so this node has a stable PeerId.
     #[arg(long)]
     identity_file: Option<std::path::PathBuf>,
+
+    /// Postgres URL for the context layer (sessions, turns, facts,
+    /// summaries, warm-node tracking). When unset the node runs in
+    /// stateless single-turn mode.
+    #[arg(long, env = "DATABASE_URL")]
+    database_url: Option<String>,
 }
 
 #[tokio::main]
@@ -124,6 +127,35 @@ async fn main() -> Result<()> {
     })
     .await?;
 
+    // Build the context-layer plumbing if both Postgres and Walrus are
+    // configured. Either one alone is a mis-config — fail loudly so
+    // operators notice instead of silently dropping history.
+    let walrus_configured =
+        std::env::var_os("WALRUS_LOCAL_DIR").is_some() || std::env::var_os("WALRUS_PUBLISHER_URL").is_some();
+    let (pg, walrus) = match (&args.database_url, walrus_configured) {
+        (Some(url), true) => {
+            let pg = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(8)
+                .connect(url)
+                .await
+                .context("connect Postgres for context layer")?;
+            let walrus = walrus::WalrusClient::from_env().context("init Walrus client")?;
+            tracing::info!("context layer enabled (Postgres + Walrus)");
+            (Some(pg), Some(Arc::new(walrus)))
+        }
+        (None, false) => {
+            tracing::warn!(
+                "stateless mode — DATABASE_URL and WALRUS_* unset, conversation history will not be retained"
+            );
+            (None, None)
+        }
+        _ => {
+            anyhow::bail!(
+                "context layer requires BOTH DATABASE_URL and WALRUS_LOCAL_DIR (or WALRUS_PUBLISHER_URL+WALRUS_AGGREGATOR_URL)"
+            );
+        }
+    };
+
     let http_state = http::State {
         ollama_url: args.ollama_url.clone(),
         model: args.model.clone(),
@@ -133,6 +165,8 @@ async fn main() -> Result<()> {
         coord_pubkey,
         mesh: mesh_handle.cmd_tx.clone(),
         inflight,
+        pg,
+        walrus,
     };
 
     http::serve(&args.listen, http_state).await?;

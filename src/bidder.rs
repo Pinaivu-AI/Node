@@ -30,5 +30,7 @@ pub fn build_bid(req: &InferenceRequest, cfg: &BidConfig) -> Option<InferenceBid
         reputation: 0.9,
         http_endpoint: cfg.http_endpoint.clone(),
         payout_address: cfg.payout_address.clone(),
+        // Encrypted prompts not yet supported on the node side.
+        node_x25519_pubkey: None,
     })
 }

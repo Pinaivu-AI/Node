@@ -17,7 +17,7 @@ struct ChatRequest<'a> {
     stream: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct ChatMessage<'a> {
     pub role: &'a str,
     pub content: &'a str,
@@ -37,11 +37,12 @@ struct ChatResponseMessage {
     content: String,
 }
 
-pub async fn chat(ollama_url: &str, model: &str, prompt: &str) -> Result<OllamaReply> {
+/// Run a chat completion against Ollama with an assembled message list.
+pub async fn chat(ollama_url: &str, model: &str, messages: &[ChatMessage<'_>]) -> Result<OllamaReply> {
     let url = format!("{}/api/chat", ollama_url.trim_end_matches('/'));
     let body = ChatRequest {
         model,
-        messages: &[ChatMessage { role: "user", content: prompt }],
+        messages,
         stream: false,
     };
     let start = std::time::Instant::now();
