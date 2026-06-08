@@ -12,6 +12,12 @@ mod inflight;
 mod mesh;
 mod ollama;
 
+// Phase 16 context layer — fully wired in Step 3.
+#[allow(dead_code)]
+mod cipher;
+#[allow(dead_code)]
+mod walrus;
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
