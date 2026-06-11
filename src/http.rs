@@ -67,6 +67,11 @@ struct InferenceReq {
     /// Wiped from memory after the turn.
     #[serde(default, with = "session_key_b64")]
     session_key: Option<[u8; 32]>,
+    /// Cross-session memory facts from the chat-relayer's own pgvector
+    /// store. When present, prepended into the system prompt before the
+    /// intra-session history. Absent for direct API callers.
+    #[serde(default)]
+    memwal_context: Option<String>,
 }
 
 mod session_key_b64 {
@@ -155,6 +160,7 @@ async fn handle_inference(
             &loaded.context,
             &req.new_user_message,
             Budget::for_model(&state.model),
+            req.memwal_context.as_deref(),
         );
         (assembled, Some(loaded))
     } else {
@@ -163,6 +169,7 @@ async fn handle_inference(
             &context::SessionContext::default(),
             &req.new_user_message,
             Budget::for_model(&state.model),
+            req.memwal_context.as_deref(),
         );
         (assembled, None)
     };

@@ -46,8 +46,19 @@ fn approx_tokens(s: &str) -> usize {
 }
 
 /// Build the system prompt with optional facts + summary preamble.
-fn render_system_prompt(ctx: &SessionContext) -> String {
+///
+/// `memwal_context` — cross-session facts from the chat-relayer's memory
+/// store. Prepended before the intra-session facts so they form the outer
+/// ring of context that's always visible.
+fn render_system_prompt(ctx: &SessionContext, memwal_context: Option<&str>) -> String {
     let mut out = String::from(DEFAULT_SYSTEM_PROMPT);
+    if let Some(mc) = memwal_context {
+        if !mc.trim().is_empty() {
+            out.push_str("\n\nRelevant long-term memory:\n");
+            out.push_str(mc);
+            out.push('\n');
+        }
+    }
     if !ctx.user_facts.is_empty() {
         out.push_str("\n\nKnown facts about the user:\n");
         for f in &ctx.user_facts {
@@ -72,8 +83,15 @@ pub struct Assembled {
 /// Produce the final message list for the model. The new user message
 /// is always included; older messages are dropped (oldest first) if
 /// the budget is exceeded.
-pub fn build(ctx: &SessionContext, new_user_message: &str, budget: Budget) -> Assembled {
-    let system_prompt = render_system_prompt(ctx);
+///
+/// `memwal_context` — optional cross-session facts from the chat-relayer.
+pub fn build(
+    ctx: &SessionContext,
+    new_user_message: &str,
+    budget: Budget,
+    memwal_context: Option<&str>,
+) -> Assembled {
+    let system_prompt = render_system_prompt(ctx, memwal_context);
     let budget_tokens = budget.input_budget_tokens();
 
     // Start with system + new user message — these are non-negotiable.
@@ -116,7 +134,7 @@ mod tests {
     #[test]
     fn empty_context_yields_single_user_turn() {
         let ctx = SessionContext::default();
-        let a = build(&ctx, "hi", Budget::for_model("llama3.2:1b"));
+        let a = build(&ctx, "hi", Budget::for_model("llama3.2:1b"), None);
         assert_eq!(a.messages.len(), 1);
         assert_eq!(a.messages[0].role, "user");
         assert_eq!(a.messages[0].content, "hi");
@@ -129,7 +147,7 @@ mod tests {
             summary: Some("earlier: discussed P2P".into()),
             recent_messages: vec![],
         };
-        let a = build(&ctx, "go on", Budget::for_model("llama3.2:1b"));
+        let a = build(&ctx, "go on", Budget::for_model("llama3.2:1b"), None);
         assert!(a.system_prompt.contains("user prefers Rust"));
         assert!(a.system_prompt.contains("discussed P2P"));
     }
@@ -146,7 +164,7 @@ mod tests {
                 msg("assistant", "answer-2"),
             ],
         };
-        let a = build(&ctx, "third", Budget::for_model("llama3.2:1b"));
+        let a = build(&ctx, "third", Budget::for_model("llama3.2:1b"), None);
         let contents: Vec<&str> = a.messages.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(contents, vec!["first", "answer-1", "second", "answer-2", "third"]);
     }
@@ -167,7 +185,7 @@ mod tests {
             model_context_window: 8_192,
             reserved_for_output: 2_048,
         };
-        let a = build(&ctx, "tiny new message", budget);
+        let a = build(&ctx, "tiny new message", budget, None);
         // We must keep the new user message; we must NOT keep all three
         // big history messages — they would blow the budget.
         assert_eq!(a.messages.last().unwrap().content, "tiny new message");
