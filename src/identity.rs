@@ -40,7 +40,20 @@ struct EnclaveHealth {
 /// running any inference.
 pub async fn fetch_coordinator_pubkey(coordinator_http: &str) -> Result<[u8; 32]> {
     let url = format!("{}/enclave_health", coordinator_http.trim_end_matches('/'));
-    let resp: EnclaveHealth = reqwest::get(&url)
+    // Dev/local: when the coordinator presents a self-signed cert
+    // (`cargo run` without operator-supplied TLS), `INSECURE_COORDINATOR=1`
+    // skips cert validation for this one bootstrap fetch.
+    let insecure = std::env::var("INSECURE_COORDINATOR")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(insecure)
+        .build()
+        .context("build reqwest client")?;
+    let resp: EnclaveHealth = client
+        .get(&url)
+        .send()
         .await
         .with_context(|| format!("GET {url}"))?
         .json()
