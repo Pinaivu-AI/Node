@@ -84,7 +84,16 @@ pub async fn spawn(cfg: Config) -> Result<Handle> {
         .with_tcp(
             libp2p::tcp::Config::default(),
             libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
+            // Widen yamux limits well beyond a single inference reply's
+            // CBOR payload — must match the coordinator side's config
+            // (mesh/mod.rs::spawn_libp2p_mesh_full) for consistent
+            // behavior on this connection.
+            || {
+                let mut cfg = libp2p::yamux::Config::default();
+                cfg.set_receive_window_size(4 * 1024 * 1024);
+                cfg.set_max_buffer_size(16 * 1024 * 1024);
+                cfg
+            },
         )
         .map_err(|e| anyhow!("tcp transport: {e}"))?
         .with_behaviour(|key| {
@@ -92,7 +101,10 @@ pub async fn spawn(cfg: Config) -> Result<Handle> {
                 .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
         })
         .map_err(|e| anyhow!("compose behaviour: {e}"))?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        // Generous headroom above the inference request_timeout (120s,
+        // see pinaivu-protocol's behaviour.rs) so the connection itself
+        // never closes out from under a still-in-flight long reply.
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
 
     // Subscribe to the marketplace topics the coordinator publishes on.
