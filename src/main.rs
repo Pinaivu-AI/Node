@@ -113,20 +113,6 @@ async fn main() -> Result<()> {
         "coordinator pubkey discovered"
     );
 
-    // Spawn the libp2p mesh; returns a handle the HTTP layer uses to
-    // send CompletionAck via request-response.
-    let mesh_handle = mesh::spawn(mesh::Config {
-        identity: identity.clone(),
-        coordinator_addr: args.coordinator_addr.clone(),
-        listen_addr: "/ip4/0.0.0.0/tcp/0".parse().unwrap(),
-        model: args.model.clone(),
-        price_per_1k_nanox: args.price_per_1k_nanox,
-        advertise_url: advertise_url.clone(),
-        payout_address: args.payout_address.clone(),
-        inflight: inflight.clone(),
-    })
-    .await?;
-
     // Build the context-layer plumbing if both Postgres and Walrus are
     // configured. Either one alone is a mis-config — fail loudly so
     // operators notice instead of silently dropping history.
@@ -156,19 +142,26 @@ async fn main() -> Result<()> {
         }
     };
 
-    let http_state = http::State {
-        ollama_url: args.ollama_url.clone(),
-        model: args.model.clone(),
+    // Spawn the libp2p mesh; returns a handle the HTTP layer uses to
+    // send CompletionAck via request-response, plus the fully-built
+    // `http::State` (the event loop needs the same state to run
+    // inbound `InferenceDispatch` jobs that arrive over libp2p).
+    let mesh_handle = mesh::spawn(mesh::Config {
         identity: identity.clone(),
-        node_peer_id: mesh_handle.peer_id.to_string(),
+        coordinator_addr: args.coordinator_addr.clone(),
+        listen_addr: "/ip4/0.0.0.0/tcp/0".parse().unwrap(),
+        model: args.model.clone(),
         price_per_1k_nanox: args.price_per_1k_nanox,
+        advertise_url: advertise_url.clone(),
+        payout_address: args.payout_address.clone(),
+        inflight: inflight.clone(),
+        ollama_url: args.ollama_url.clone(),
         coord_pubkey,
-        mesh: mesh_handle.cmd_tx.clone(),
-        inflight,
         pg,
         walrus,
-    };
+    })
+    .await?;
 
-    http::serve(&args.listen, http_state).await?;
+    http::serve(&args.listen, mesh_handle.state).await?;
     Ok(())
 }

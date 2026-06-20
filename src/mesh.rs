@@ -8,25 +8,30 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use ed25519_dalek::SigningKey;
 use futures::StreamExt;
 use libp2p::{
     gossipsub::{self, IdentTopic},
     multiaddr::Protocol,
-    request_response::{self, OutboundRequestId},
+    request_response::{self, OutboundRequestId, ResponseChannel},
     swarm::SwarmEvent,
     Multiaddr, PeerId, Swarm,
 };
 use pinaivu_protocol::mesh::{
     behaviour::{libp2p_identity_from_ed25519_secret, PinaivuBehaviour, PinaivuBehaviourEvent},
     completion_proto::{CompletionAck, CompletionResponse},
+    inference_proto::{InferenceDispatch, InferenceReply},
     topics::{BIDS, INFERENCE_ANY},
 };
 use pinaivu_protocol::InferenceRequest;
+use sqlx::PgPool;
 use tokio::sync::mpsc;
 
 use crate::bidder::{build_bid, BidConfig};
+use crate::http::{self, run_inference_job};
 use crate::inflight::Inflight;
+use crate::walrus::WalrusClient;
 
 pub struct Config {
     pub identity: SigningKey,
@@ -39,11 +44,21 @@ pub struct Config {
     /// Sui address advertised in every InferenceBid as the destination
     /// for on-chain settlement payouts. Plumbed from CLI.
     pub payout_address: String,
+    /// Everything else `http::State` needs, so the event loop can run
+    /// inbound `InferenceDispatch` jobs (the NAT-safe libp2p path)
+    /// using the exact same pipeline as the HTTP `/v1/inference` path.
+    pub ollama_url: String,
+    pub coord_pubkey: [u8; 32],
+    pub pg: Option<PgPool>,
+    pub walrus: Option<Arc<WalrusClient>>,
 }
 
 pub struct Handle {
     pub peer_id: PeerId,
     pub cmd_tx: mpsc::Sender<Command>,
+    /// Fully-built state, shared with the HTTP server so both paths
+    /// (libp2p and direct-dial HTTP) run identical inference logic.
+    pub state: http::State,
 }
 
 pub enum Command {
@@ -51,6 +66,12 @@ pub enum Command {
     /// channel level; the event loop awaits the libp2p response and
     /// logs it but the caller doesn't block on it.
     SendCompletionAck(CompletionAck),
+    /// Reply to an inbound `InferenceDispatch` once the (possibly slow)
+    /// inference job spawned off the event loop has finished.
+    SendInferenceReply {
+        channel: ResponseChannel<InferenceReply>,
+        reply: InferenceReply,
+    },
 }
 
 pub async fn spawn(cfg: Config) -> Result<Handle> {
@@ -113,11 +134,33 @@ pub async fn spawn(cfg: Config) -> Result<Handle> {
 
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
 
-    tokio::spawn(run_event_loop(swarm, cmd_rx, bid_cfg, cfg.inflight, coord_peer));
+    let state = http::State {
+        ollama_url: cfg.ollama_url,
+        model: cfg.model,
+        identity: cfg.identity,
+        node_peer_id: local_peer_id.to_string(),
+        price_per_1k_nanox: cfg.price_per_1k_nanox,
+        coord_pubkey: cfg.coord_pubkey,
+        mesh: cmd_tx.clone(),
+        inflight: cfg.inflight,
+        pg: cfg.pg,
+        walrus: cfg.walrus,
+    };
+
+    tokio::spawn(run_event_loop(
+        swarm,
+        cmd_rx,
+        bid_cfg,
+        state.inflight.clone(),
+        coord_peer,
+        state.clone(),
+        cmd_tx.clone(),
+    ));
 
     Ok(Handle {
         peer_id: local_peer_id,
         cmd_tx,
+        state,
     })
 }
 
@@ -136,6 +179,8 @@ async fn run_event_loop(
     bid_cfg: BidConfig,
     inflight: Arc<Inflight>,
     coord_peer: PeerId,
+    state: http::State,
+    self_cmd_tx: mpsc::Sender<Command>,
 ) {
     // Track in-flight outbound completion requests so we can log their
     // results without blocking the HTTP path.
@@ -155,6 +200,9 @@ async fn run_event_loop(
                             .send_request(&coord_peer, ack);
                         pending_acks.insert(out_id, req_id);
                         tracing::info!(request_id = %req_id, "sent CompletionAck");
+                    }
+                    Command::SendInferenceReply { channel, reply } => {
+                        let _ = swarm.behaviour_mut().inference.send_response(channel, reply);
                     }
                 }
             }
@@ -210,9 +258,96 @@ async fn run_event_loop(
                     let req = pending_acks.remove(&request_id);
                     tracing::warn!(?req, ?error, "completion outbound failure");
                 }
+                SwarmEvent::Behaviour(PinaivuBehaviourEvent::Inference(
+                    request_response::Event::Message {
+                        message: request_response::Message::Request { request, channel, .. },
+                        ..
+                    }
+                )) => {
+                    tracing::info!(
+                        request_id = %request.dispatch_token.request_id,
+                        "received inference dispatch over libp2p"
+                    );
+                    let state = state.clone();
+                    let reply_tx = self_cmd_tx.clone();
+                    tokio::spawn(async move {
+                        let reply = run_dispatch(state, request).await;
+                        let _ = reply_tx.send(Command::SendInferenceReply { channel, reply }).await;
+                    });
+                }
                 _ => {}
             }
         }
+    }
+}
+
+/// Run an inbound `InferenceDispatch` through the same pipeline the
+/// HTTP `/v1/inference` handler uses, and build the `InferenceReply`
+/// to send back. Runs off the event loop (spawned by the caller) since
+/// inference can take seconds and must not block the swarm.
+async fn run_dispatch(state: http::State, dispatch: InferenceDispatch) -> InferenceReply {
+    let request_id = dispatch.dispatch_token.request_id;
+    let session_id = dispatch.dispatch_token.session_id;
+
+    let session_key = if dispatch.session_key.is_empty() {
+        None
+    } else {
+        match B64.decode(dispatch.session_key.as_bytes()) {
+            Ok(raw) => match <[u8; 32]>::try_from(raw.as_slice()) {
+                Ok(arr) => Some(arr),
+                Err(_) => {
+                    return InferenceReply {
+                        request_id,
+                        session_id,
+                        content: String::new(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        latency_ms: 0,
+                        error: Some("session_key must decode to 32 bytes".into()),
+                    };
+                }
+            },
+            Err(e) => {
+                return InferenceReply {
+                    request_id,
+                    session_id,
+                    content: String::new(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    latency_ms: 0,
+                    error: Some(format!("session_key not valid base64: {e}")),
+                };
+            }
+        }
+    };
+
+    match run_inference_job(
+        &state,
+        dispatch.dispatch_token,
+        session_key,
+        dispatch.new_user_message,
+        dispatch.memwal_context,
+    )
+    .await
+    {
+        Ok(out) => InferenceReply {
+            request_id: out.request_id,
+            session_id: out.session_id,
+            content: out.content,
+            input_tokens: out.input_tokens,
+            output_tokens: out.output_tokens,
+            latency_ms: out.latency_ms,
+            error: None,
+        },
+        Err(e) => InferenceReply {
+            request_id,
+            session_id,
+            content: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            latency_ms: 0,
+            error: Some(e.message),
+        },
     }
 }
 

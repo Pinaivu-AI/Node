@@ -104,53 +104,57 @@ struct InferenceResp {
     latency_ms: u32,
 }
 
-pub async fn serve(addr: &str, state: State) -> Result<()> {
-    let app = Router::new()
-        .route("/v1/inference", post(handle_inference))
-        .with_state(state);
-    let listener = TcpListener::bind(addr).await?;
-    tracing::info!(listening = %listener.local_addr()?, "node http ready");
-    axum::serve(listener, app).await?;
-    Ok(())
+/// Result of [`run_inference_job`] — shape shared by both the legacy
+/// HTTP path and the libp2p `InferenceReply` path.
+pub struct InferenceOutput {
+    pub request_id: Uuid,
+    pub session_id: Uuid,
+    pub content: String,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub latency_ms: u32,
 }
 
-async fn handle_inference(
-    AxumState(state): AxumState<State>,
-    Json(mut req): Json<InferenceReq>,
-) -> Result<Json<InferenceResp>, ErrorResponse> {
+/// Core inference pipeline: verify the dispatch token, assemble
+/// context (stateful or stateless), call the model, persist the turn,
+/// and fire the CompletionAck. Shared by the HTTP `/v1/inference`
+/// handler (kept for direct-dial / publicly-reachable nodes) and the
+/// libp2p `InferenceDispatch` handler (works through NAT — see
+/// `mesh.rs`).
+pub async fn run_inference_job(
+    state: &State,
+    dispatch_token: DispatchToken,
+    session_key: Option<[u8; 32]>,
+    new_user_message: String,
+    memwal_context: Option<String>,
+) -> Result<InferenceOutput, ErrorResponse> {
     // 1. Verify the dispatch token came from the coordinator we trust.
-    if req.dispatch_token.coordinator_pubkey != state.coord_pubkey {
+    if dispatch_token.coordinator_pubkey != state.coord_pubkey {
         return Err(ErrorResponse::unauthorized(
             "dispatch token signed by unknown coordinator",
         ));
     }
-    req.dispatch_token
+    dispatch_token
         .verify()
         .map_err(|e| ErrorResponse::unauthorized(format!("dispatch token verify failed: {e}")))?;
 
-    let request_id = req.dispatch_token.request_id;
-    let session_id = req.dispatch_token.session_id;
+    let request_id = dispatch_token.request_id;
+    let session_id = dispatch_token.session_id;
 
-    // 2. Body session_id must agree with the signed dispatch token, and
-    //    we must have bid on this request.
-    if req.session_id != session_id {
-        return Err(ErrorResponse::bad_request(
-            "session_id does not match dispatch_token.session_id",
-        ));
-    }
     if !state.inflight.contains(&request_id) {
         return Err(ErrorResponse::bad_request(
             "no matching bid for this request_id",
         ));
     }
 
-    let client_address = hex::encode(req.dispatch_token.client_pubkey);
+    let client_address = hex::encode(dispatch_token.client_pubkey);
+    let mut session_key = session_key;
 
-    // 3. Fetch + assemble context (stateful mode) or build a one-message
+    // 2. Fetch + assemble context (stateful mode) or build a one-message
     //    array (stateless fallback).
     let stateful = state.pg.as_ref().zip(state.walrus.as_ref());
     let (assembled, loaded) = if let Some((pg, walrus)) = stateful {
-        let key = req.session_key.ok_or_else(|| {
+        let key = session_key.ok_or_else(|| {
             ErrorResponse::bad_request("session_key is required for stateful turns")
         })?;
         let loaded = context::fetch::load(pg, walrus, session_id, &key, &client_address)
@@ -158,23 +162,23 @@ async fn handle_inference(
             .map_err(|e| ErrorResponse::internal(format!("context fetch: {e}")))?;
         let assembled = context::assemble::build(
             &loaded.context,
-            &req.new_user_message,
+            &new_user_message,
             Budget::for_model(&state.model),
-            req.memwal_context.as_deref(),
+            memwal_context.as_deref(),
         );
         (assembled, Some(loaded))
     } else {
         // Stateless: just the user message, default system prompt.
         let assembled = context::assemble::build(
             &context::SessionContext::default(),
-            &req.new_user_message,
+            &new_user_message,
             Budget::for_model(&state.model),
-            req.memwal_context.as_deref(),
+            memwal_context.as_deref(),
         );
         (assembled, None)
     };
 
-    // 4. Run inference with the assembled message list.
+    // 3. Run inference with the assembled message list.
     let ollama_msgs: Vec<ollama::ChatMessage<'_>> =
         std::iter::once(ollama::ChatMessage {
             role: "system",
@@ -194,11 +198,11 @@ async fn handle_inference(
         .await
         .map_err(|e| ErrorResponse::internal(format!("ollama: {e}")))?;
 
-    // 5. Persist (only in stateful mode).
+    // 4. Persist (only in stateful mode).
     if let (Some(pg), Some(walrus), Some(key), Some(loaded)) = (
         state.pg.as_ref(),
         state.walrus.as_ref(),
-        req.session_key.as_ref(),
+        session_key.as_ref(),
         loaded,
     ) {
         let prior = loaded.context.recent_messages.clone();
@@ -210,7 +214,7 @@ async fn handle_inference(
             user_address: &client_address,
             model_id: &state.model,
             node_peer_id: &state.node_peer_id,
-            new_user_message: &req.new_user_message,
+            new_user_message: &new_user_message,
             assistant_reply: &reply.content,
             input_tokens: reply.prompt_tokens,
             output_tokens: reply.completion_tokens,
@@ -221,38 +225,28 @@ async fn handle_inference(
             session_existed,
         };
         if let Err(e) = context::persist::commit(pg, walrus, key, input).await {
-            // Don't fail the client response on persistence errors —
-            // the inference still happened and the coordinator gets a
+            // Don't fail the caller on persistence errors — the
+            // inference still happened and the coordinator gets a
             // proof. Log loudly so we can investigate.
             tracing::error!(error = %e, session_id = %session_id,
                 "context persist failed; turn served but history not saved");
         }
     }
 
-    // 6. Build the client response.
-    let resp = InferenceResp {
-        request_id,
-        session_id,
-        content: reply.content.clone(),
-        input_tokens: reply.prompt_tokens,
-        output_tokens: reply.completion_tokens,
-        latency_ms: reply.latency_ms,
-    };
-
-    // Wipe the session key before we hand control off to the spawned task.
-    if let Some(mut k) = req.session_key.take() {
+    // Wipe the session key before handing control off to the spawned task.
+    if let Some(mut k) = session_key.take() {
         k.zeroize();
     }
 
-    // 7. Fire-and-forget CompletionAck so the client doesn't wait on
+    // 5. Fire-and-forget CompletionAck so the caller doesn't wait on
     //    the coordinator's libp2p round-trip.
     let inputs = ProofInputs {
         request_id,
         session_id,
         client_address: client_address.clone(),
         model_id: state.model.clone(),
-        prompt: req.new_user_message,
-        output: reply.content,
+        prompt: new_user_message,
+        output: reply.content.clone(),
         input_tokens: reply.prompt_tokens,
         output_tokens: reply.completion_tokens,
         latency_ms: reply.latency_ms,
@@ -269,28 +263,78 @@ async fn handle_inference(
         inflight.forget(&request_id);
     });
 
-    Ok(Json(resp))
+    Ok(InferenceOutput {
+        request_id,
+        session_id,
+        content: reply.content,
+        input_tokens: reply.prompt_tokens,
+        output_tokens: reply.completion_tokens,
+        latency_ms: reply.latency_ms,
+    })
 }
 
-struct ErrorResponse {
+pub async fn serve(addr: &str, state: State) -> Result<()> {
+    let app = Router::new()
+        .route("/v1/inference", post(handle_inference))
+        .with_state(state);
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!(listening = %listener.local_addr()?, "node http ready");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn handle_inference(
+    AxumState(state): AxumState<State>,
+    Json(req): Json<InferenceReq>,
+) -> Result<Json<InferenceResp>, ErrorResponse> {
+    // Body session_id must agree with the signed dispatch token — this
+    // check only applies to the HTTP path, which carries session_id
+    // twice (once free-standing, once inside the token) for defense in
+    // depth; the libp2p path only carries it inside the token.
+    if req.session_id != req.dispatch_token.session_id {
+        return Err(ErrorResponse::bad_request(
+            "session_id does not match dispatch_token.session_id",
+        ));
+    }
+
+    let out = run_inference_job(
+        &state,
+        req.dispatch_token,
+        req.session_key,
+        req.new_user_message,
+        req.memwal_context,
+    )
+    .await?;
+
+    Ok(Json(InferenceResp {
+        request_id: out.request_id,
+        session_id: out.session_id,
+        content: out.content,
+        input_tokens: out.input_tokens,
+        output_tokens: out.output_tokens,
+        latency_ms: out.latency_ms,
+    }))
+}
+
+pub struct ErrorResponse {
     status: axum::http::StatusCode,
-    message: String,
+    pub message: String,
 }
 
 impl ErrorResponse {
-    fn unauthorized(msg: impl Into<String>) -> Self {
+    pub fn unauthorized(msg: impl Into<String>) -> Self {
         Self {
             status: axum::http::StatusCode::UNAUTHORIZED,
             message: msg.into(),
         }
     }
-    fn bad_request(msg: impl Into<String>) -> Self {
+    pub fn bad_request(msg: impl Into<String>) -> Self {
         Self {
             status: axum::http::StatusCode::BAD_REQUEST,
             message: msg.into(),
         }
     }
-    fn internal(msg: impl Into<String>) -> Self {
+    pub fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             message: msg.into(),
