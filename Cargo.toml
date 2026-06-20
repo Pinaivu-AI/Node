@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Shared protocol — path dep during local dev; switch to git once stable.
-pinaivu-protocol = { path = "../coordinator  /src/pinaivu-protocol" }
+pinaivu-protocol = { path = "../coordinator/src/pinaivu-protocol" }
 
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
