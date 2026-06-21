@@ -1,11 +1,21 @@
 # pinaivu-node
 
-GPU provider daemon for the Pinaivu inference marketplace.
+GPU provider daemon for Pinaivu's decentralized inference network.
 
 The node joins the coordinator's libp2p mesh, bids on inference auctions,
 runs jobs against a local LLM (Ollama by default), and reports a signed
 `CompletionAck` back to the coordinator so the request earns a routing
-receipt.
+receipt. Anyone can run a node and join the mesh; no permission from
+Pinaivu is required. This is the genuinely decentralized layer of the
+network, alongside Walrus storage — see the [decentralization &
+verifiability model](https://docs.pinaivu.com/architecture/decentralization)
+for how it fits with the off-chain-verifiable coordinator and the on-chain
+Sui contracts.
+
+For stateful sessions the node fetches conversation history from Postgres
+and an encrypted Walrus blob, decrypts it with a per-session key the
+client supplies, and persists the updated session back to Walrus after
+each turn. Stateless one-shot requests are also supported.
 
 ## Run
 
@@ -27,6 +37,9 @@ cargo run --release -- \
   --price-per-1k-nanox 50
 ```
 
+Stateful sessions additionally need `DATABASE_URL` set so the node can
+fetch and persist conversation history.
+
 ## Client smoke
 
 ```bash
@@ -36,11 +49,16 @@ RESP=$(curl -s -X POST http://localhost:4000/v1/chat/completions \
 NODE_URL=$(echo "$RESP" | jq -r .node_url)
 TOKEN=$(echo "$RESP" | jq -c .dispatch_token)
 REQ=$(echo "$RESP" | jq -r .request_id)
+SESSION_ID=$(echo "$RESP" | jq -r .session_id)
 
 curl -s -X POST "$NODE_URL/v1/inference" \
   -H 'content-type: application/json' \
-  -d "{\"prompt\":\"what is 1+1?\",\"dispatch_token\":$TOKEN}" | jq .
+  -d "{\"new_user_message\":\"what is 1+1?\",\"dispatch_token\":$TOKEN,\"session_id\":\"$SESSION_ID\"}" | jq .
 
 sleep 1
 curl -s "http://localhost:4000/v1/proofs/$REQ" | jq .
 ```
+
+Add `"session_key": "<base64 32 bytes>"` to the `/v1/inference` body to
+make the turn stateful: the node will fetch and persist conversation
+history for that `session_id`, encrypted with that key.
